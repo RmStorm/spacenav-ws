@@ -18,10 +18,7 @@ from spacenav_ws.wamp import WampSession
 logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 
 ORIGINS = [
-    "https://127.51.68.120",
-    "https://127.51.68.120:8181",
-    "https://3dconnexion.com",
-    "https://cad.onshape.com",
+    "*",
 ]
 
 CERT_FILE = Path(__file__).parent / "certs" / "ip.crt"
