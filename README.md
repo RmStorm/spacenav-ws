@@ -43,6 +43,24 @@ Install [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonk
 
 4. **Open an Onshape document and test your mouse!**
 
+## Autostart with systemd (optional)
+
+To run spacenav-ws automatically on login, install the provided systemd user service:
+
+```bash
+cp additional/spacenav-ws.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spacenav-ws.service
+```
+
+Check the status with:
+
+```bash
+systemctl --user status spacenav-ws.service
+```
+
+> **Note:** This requires `uvx` to be available at `/usr/bin/uvx`. If installed elsewhere, adjust the `ExecStart` path in the service file.
+
 ## Developing
 
 ```bash

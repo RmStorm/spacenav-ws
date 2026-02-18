@@ -1,0 +1,12 @@
+[Unit]
+Description=SpaceMouse WebSocket Bridge for Onshape
+After=spacenavd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/uvx spacenav-ws@latest serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
