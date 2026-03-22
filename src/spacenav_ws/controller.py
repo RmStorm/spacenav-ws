@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import struct
+import time
 from typing import Any
 
 import numpy as np
@@ -30,7 +31,7 @@ class Controller:
         reader (asyncio.StreamReader):
             Asynchronous stream reader for receiving raw 3D mouse packets.
         _ (Mouse3d):
-            Doesn't do anything.. things should be restructured so that it does probably.
+            Doesn’t do anything.. things should be restructured so that it does probably.
         wamp_state_handler (WampSession):
             WAMP session handler that manages subscriptions and RPC calls.
         client_metadata (dict):
@@ -51,6 +52,8 @@ class Controller:
             True when this controller is in focus and should send events.
     """
 
+    CACHE_REFRESH_INTERVAL = 0.5  # seconds between slow-state refreshes
+
     def __init__(self, reader: asyncio.StreamReader, _: Mouse3d, wamp_state_handler: WampSession, client_metadata: dict):
         self.id = "controller0"
         self.client_metadata = client_metadata
@@ -62,6 +65,12 @@ class Controller:
 
         self.subscribed = False
         self.focus = False
+
+        # Cached slow-changing state (refreshed periodically, not every event)
+        self._cached_model_extents: list | None = None
+        self._cached_perspective: bool | None = None
+        self._cached_extents: list | None = None
+        self._cache_time: float = 0.0
 
     async def subscribe(self, msg: Subscribe):
         """When a subscription request for self.controller_uri comes in we start broadcasting!"""
@@ -85,18 +94,33 @@ class Controller:
     async def remote_read(self, *args):
         return await self.wamp_state_handler.client_rpc(self.controller_uri, "self:read", *args)
 
+    async def _refresh_cache(self):
+        """Fetch slow-changing state from the client, concurrently."""
+        self._cached_model_extents, self._cached_perspective, self._cached_extents = await asyncio.gather(
+            self.remote_read("model.extents"),
+            self.remote_read("view.perspective"),
+            self.remote_read("view.extents"),
+        )
+        self._cache_time = time.monotonic()
+
     async def start_mouse_event_stream(self):
-        """Right now we try to send every event to the client.. we should possibly maybe debounce?"""
+        """Read spacenav events, dropping stale ones so only the latest is processed."""
         logging.info("Starting the mouse stream")
         while True:
             mouse_event = await self.reader.read(32)
-            if self.focus and self.subscribed:
-                nums = struct.unpack("iiiiiiii", mouse_event)
-                event = from_message(list(nums))
-                if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
-                    await self.update_client(event)
-                else:
-                    logging.warning("Unknown client! Cannot send mouse events, client_metadata:%s", self.client_metadata)
+            if not (self.focus and self.subscribed):
+                continue
+            # Drain any queued events so we only process the most recent one
+            while len(self.reader._buffer) >= 32:
+                mouse_event = bytes(self.reader._buffer[:32])
+                del self.reader._buffer[:32]
+
+            nums = struct.unpack("iiiiiiii", mouse_event)
+            event = from_message(list(nums))
+            if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
+                await self.update_client(event)
+            else:
+                logging.warning("Unknown client! Cannot send mouse events, client_metadata:%s", self.client_metadata)
 
     @staticmethod
     def get_affine_pivot_matrices(model_extents):
@@ -116,15 +140,23 @@ class Controller:
         view.target, view.constructionPlane, view.extents, view.affine, view.perspective, model.extents, selection.empty, selection.extents, hit.lookat, views.front
 
         """
-        model_extents = await self.remote_read("model.extents")
+        # Refresh cached slow-changing state periodically (or on first call)
+        if self._cached_model_extents is None or (time.monotonic() - self._cache_time) > self.CACHE_REFRESH_INTERVAL:
+            await self._refresh_cache()
+
+        model_extents = self._cached_model_extents
+        perspective = self._cached_perspective
+        extents = self._cached_extents
 
         if isinstance(event, ButtonEvent):
-            await self.remote_write("view.affine", await self.remote_read("views.front"))
+            front_view = await self.remote_read("views.front")
+            await self.remote_write("view.affine", front_view)
             await self.remote_write("view.extents", [c * 1.2 for c in model_extents])
+            # Force cache refresh after button press (view changed drastically)
+            self._cached_model_extents = None
             return
 
-        # 1) pull down the current extents and model matrix
-        perspective = await self.remote_read("view.perspective")
+        # 1) Only read the rapidly-changing affine matrix (the one we actually need every frame)
         curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float32).reshape(4, 4)
 
         # This (transpose of top left quadrant) is the correct way to get the rotation matrix of the camera but it is unstable.. Either of the below methods works fine though.
@@ -135,30 +167,34 @@ class Controller:
         R_cam = U @ Vt
 
         # 2) Seperately calculate rotation and translation matrices
-        angles = np.array([event.pitch, event.yaw, -event.roll]) * 0.02
+        angles = np.array([event.pitch, event.yaw, -event.roll]) * 0.01
         R_delta_cam = transform.Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
         R_world = R_cam @ R_delta_cam @ R_cam.T
 
         rot_delta = np.eye(4, dtype=np.float32)
         rot_delta[:3, :3] = R_world
-        trans_delta = np.eye(4, dtype=np.float32)
-        trans_delta[3, :3] = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.0005
 
-        # 3) Apply changes to the ModelViewProjection matrix
+        # 3) Apply rotation around model pivot, then add camera-relative translation.
+        #    The translation row (row 3) of the affine is in world space, so we must
+        #    rotate cam_trans from camera space into world space via R_cam before adding.
         pivot_pos, pivot_neg = self.get_affine_pivot_matrices(model_extents)
-        new_affine = trans_delta @ curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
+        new_affine = curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
 
-        # Write back changes and optionally update extents if the projection is orthographic!
+        extent_scale = sum(extents) / len(extents)  # Average visible extent for zoom-proportional sensitivity
+        cam_trans = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.000375 * extent_scale
+        new_affine[3, :3] += R_cam @ cam_trans
+
+        # 4) Write back changes — fire writes concurrently
+        writes = [self.remote_write("motion", True),
+                  self.remote_write("view.affine", new_affine.reshape(-1).tolist())]
         if not perspective:
-            extents = await self.remote_read("view.extents")
-            zoom_delta = event.y * 0.0002
+            zoom_delta = event.y * 0.0001
             scale = 1.0 + zoom_delta
             new_extents = [c * scale for c in extents]
-            await self.remote_write("motion", True)
-            await self.remote_write("view.extents", new_extents)
-        else:
-            await self.remote_write("motion", True)
-        await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
+            writes.append(self.remote_write("view.extents", new_extents))
+            # Keep cached extents in sync so the next frame uses the updated value
+            self._cached_extents = new_extents
+        await asyncio.gather(*writes)
 
 
 async def create_mouse_controller(wamp_state_handler: WampSession, spacenav_reader: asyncio.StreamReader) -> Controller:
