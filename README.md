@@ -1,54 +1,101 @@
-# Websockets exposer for the spacenav driver (spacenav‑ws)
+# spacenav-ws
 
-![PyPI version](https://img.shields.io/pypi/v/spacenav-ws)
-![Build Status](https://github.com/rmstorm/spacenav-ws/workflows/Test/badge.svg)
-![License](https://img.shields.io/github/license/rmstorm/spacenav-ws)
+`spacenav-ws` exposes a local SpaceMouse to browser clients over TLS WebSocket.
+The main target is Onshape on Linux via `spacenavd`.
 
-## Table of Contents
-
-- [About](#about)  
-- [Prerequisites](#prerequisites)  
-- [Usage](#usage)  
-- [Development](#development)  
-
-## About
-
-**spacenav‑ws** is a tiny Python CLI that exposes your 3Dconnexion SpaceMouse over a secure WebSocket, so Onshape on Linux can finally consume it. Under the hood it reverse‑engineers the same traffic Onshape’s Windows client uses and proxies it into your browser.
-
-This lets you use [FreeSpacenav/spacenavd](https://github.com/FreeSpacenav/spacenavd) on Linux with Onshape.
-
-## Prerequisites
-
-- [uv/uvx](https://docs.astral.sh/uv/getting-started/installation/) or another Python env manager.
-- A running instance of [spacenavd](https://github.com/FreeSpacenav/spacenavd)  
-- A modern browser (Chrome/Firefox) with a userscript manager (Tampermonkey/Greasemonkey)  
-
-## Usage
-
-1. **Validate spacenavd**
-```bash
-uvx spacenav-ws@latest read-mouse
-# → should print spacemouse events
-```
-
-2. **Run the server and trust the cert**
-```bash
-uvx spacenav-ws@latest serve
-```
-Now open: [https://127.51.68.120:8181](https://127.51.68.120:8181). When prompted, add a browser exception for the self‑signed cert.
-
-3. **Install Tampermonkey and add the userscript**
-
-Install [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=search). After installing, click this [link](https://greasyfork.org/en/scripts/533516-onshape-3d-mouse-on-linux-in-page-patch) for one‑click install of the script.
-
-4. **Open an Onshape document and test your mouse!**
-
-## Developing
+## Install
 
 ```bash
-git clone https://github.com/you/spacenav-ws.git
-cd spacenav-ws
-uv run spacenav-ws serve --hot-reload
+uv sync
 ```
 
-This starts the server with Uvicorn's `code watching / hot reload` feature enabled. When making changes the server restarts and any websocket state is nuked, however, Onshape should immediately reconnect automatically! This makes for a very smooth and fast iteration workflow.
+Requirements:
+
+- Linux with `spacenavd` running
+- OpenSSL available if you want managed self-signed certs
+- a browser with a userscript manager for Onshape
+
+## Quick Start
+
+```bash
+uv run spacenav-ws serve --host 127.51.68.120 --port 8181
+```
+
+This lazily creates or reuses managed certs in the default state dir:
+`~/.local/state/spacenav-ws/` for normal user runs, or `$XDG_STATE_HOME/spacenav-ws/`
+if `XDG_STATE_HOME` is set.
+
+Then open `https://127.51.68.120:8181` and:
+
+1. Trust the generated cert.
+2. Install the Onshape userscript from the landing page.
+3. Open an Onshape document.
+4. Keep that browser tab focused.
+5. Move the SpaceMouse.
+
+## Controls
+
+- button `0`: toggle `object` / `target-camera`
+- button `1`: cycle `all` -> `rotation-only` -> `translation-only` -> `all`
+
+## Commands
+
+Read raw SpaceMouse packets:
+
+```bash
+uv run spacenav-ws read-mouse
+```
+
+Override the raw-axis remap:
+
+```bash
+uv run spacenav-ws serve --remap XYzUWV
+```
+
+Write or reuse managed TLS material:
+
+```bash
+uv run spacenav-ws cert ensure --host 127.51.68.120
+```
+
+`remap` is six characters:
+
+- chars `1..3`: model translation `x y z`
+- chars `4..6`: model rotation `u v w`
+- uppercase: positive raw axis
+- lowercase: negative raw axis
+- `x y z u v w` must each appear exactly once
+
+## Certs And State
+
+- Unprivileged runs default to the user state dir, usually `~/.local/state/spacenav-ws/`.
+- Root or system-service runs default to `/var/lib/spacenav-ws/`.
+- The preferred normal-user flow is to let `serve` lazily create and reuse certs in that default user state dir.
+- Override either case with `--state-root` or `SPACENAV_WS_STATE_DIR`.
+- Pass `--cert-file` and `--key-file` if you do not want managed self-signed certs.
+
+## systemd
+
+If you want a persistent user service, start from
+[`docs/spacenav-ws.service`](docs/spacenav-ws.service).
+
+Copy it to `~/.config/systemd/user/spacenav-ws.service`, replace
+`/path/to/repo` with your checkout path, then run:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now spacenav-ws.service
+```
+
+Keep `spacenavd` dead-zone/button handling sane; avoid extra gain scaling and `bnact*` remaps.
+
+Tests:
+
+```bash
+uv run pytest -q
+```
+
+## Reference
+
+- [`docs/navigation-model.md`](docs/navigation-model.md): navigation math
+- [`docs/onshape-observations.md`](docs/onshape-observations.md): Onshape bridge contract

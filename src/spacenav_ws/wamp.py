@@ -1,208 +1,301 @@
-"""Basic WAMP V1 protocol."""
+from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import string
+from dataclasses import astuple, dataclass
 from enum import IntEnum
-from types import CoroutineType
-from typing import Any, ClassVar, Dict, NamedTuple, Optional, Type, Callable
+from typing import Any, ClassVar
 
 from fastapi import WebSocket
 
+WIRE_LOG_WAMP = os.environ.get("SPACENAV_WS_WIRE_LOG", "0") == "1"
+DEFAULT_RPC_TIMEOUT_S = 2.0
 
-def _rand_id(len) -> str:
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=len))
+
+def _generate_id(width: int) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(random.choices(alphabet, k=width))
 
 
-class WAMP_MSG_TYPE(IntEnum):
+class WampMsgType(IntEnum):
     WELCOME = 0
     PREFIX = 1
     CALL = 2
     CALLRESULT = 3
     CALLERROR = 4
     SUBSCRIBE = 5
-    UNSUBSCRIBE = 6
-    PUBLISH = 7
     EVENT = 8
 
 
-class WampMessage(tuple[Any, ...]):
-    # This WampMessage class maintains a classvariable with all the registered message types!
-    REGISTRY: Dict[WAMP_MSG_TYPE, Type["WampMessage"]] = {}
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE]
-
-    def __init_subclass__(cls) -> None:
-        super().__init_subclass__()
-        WampMessage.REGISTRY[cls.MSG_TYPE] = cls
+@dataclass(frozen=True)
+class WampMessage:
+    MSG_TYPE: ClassVar[WampMsgType]
 
     def serialize(self) -> list[Any]:
-        return list(self)
+        return list(astuple(self))
 
     def serialize_with_msg_id(self) -> list[Any]:
-        return [self.MSG_TYPE, *self.serialize()]
+        return [int(self.MSG_TYPE), *self.serialize()]
 
 
-class Welcome(NamedTuple("WelcomeBase", [("session_id", str), ("version", int), ("server_ident", str)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.WELCOME
+@dataclass(frozen=True)
+class Welcome(WampMessage):
+    session_id: str
+    version: int
+    server_ident: str
+
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.WELCOME
 
 
-class Prefix(NamedTuple("PrefixBase", [("prefix", str), ("uri", str)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.PREFIX
+@dataclass(frozen=True)
+class Prefix(WampMessage):
+    prefix: str
+    uri: str
+
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.PREFIX
 
 
-class Call(NamedTuple("CallBase", [("call_id", str), ("proc_uri", str), ("args", list[Any])]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.CALL
+@dataclass(frozen=True, init=False)
+class Call(WampMessage):
+    call_id: str
+    proc_uri: str
+    args: list[Any]
 
-    def __new__(cls, call_id: str, proc_uri: str, *args: Any):
-        return super().__new__(cls, call_id, proc_uri, list(args))
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.CALL
+
+    def __init__(self, call_id: str, proc_uri: str, *args: Any):
+        object.__setattr__(self, "call_id", call_id)
+        object.__setattr__(self, "proc_uri", proc_uri)
+        object.__setattr__(self, "args", list(args))
 
     def serialize(self) -> list[Any]:
         return [self.call_id, self.proc_uri, *self.args]
 
     @classmethod
-    def create(cls, proc_uri: str, *args: Any):
-        return Call(_rand_id(18), proc_uri, *args)
+    def create(cls, proc_uri: str, *args: Any) -> Call:
+        return cls(_generate_id(18), proc_uri, *args)
 
 
-class CallResult(NamedTuple("CallResultBase", [("call_id", str), ("result", Any)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.CALLRESULT
+@dataclass(frozen=True)
+class CallResult(WampMessage):
+    call_id: str
+    result: Any
+
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.CALLRESULT
 
 
-class CallError(NamedTuple("CallErrorBase", [("call_id", str), ("error_uri", str), ("desc", str), ("details", Optional[Any])]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.CALLERROR
+@dataclass(frozen=True)
+class CallError(WampMessage):
+    call_id: str
+    error_uri: str
+    desc: str
+    details: Any = None
 
-    def __new__(cls, call_id: str, error_uri: str, desc: str, details: Optional[Any] = None):
-        return super().__new__(cls, call_id, error_uri, desc, details)
-
-
-class Subscribe(NamedTuple("SubscribeBase", [("topic", str)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.SUBSCRIBE
-
-
-class Unsubscribe(NamedTuple("UnsubscribeBase", [("topic", str)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.UNSUBSCRIBE
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.CALLERROR
 
 
-class Publish(NamedTuple("PublishBase", [("topic", str), ("payload", Any)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.PUBLISH
+@dataclass(frozen=True)
+class Subscribe(WampMessage):
+    topic: str
+
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.SUBSCRIBE
 
 
-class Event(NamedTuple("EventBase", [("topic", str), ("payload", Any)]), WampMessage):
-    MSG_TYPE: ClassVar[WAMP_MSG_TYPE] = WAMP_MSG_TYPE.EVENT
+@dataclass(frozen=True)
+class Event(WampMessage):
+    topic: str
+    payload: Any
+
+    MSG_TYPE: ClassVar[WampMsgType] = WampMsgType.EVENT
+
+
+MESSAGE_TYPES_BY_ID: dict[WampMsgType, type[WampMessage]] = {
+    Welcome.MSG_TYPE: Welcome,
+    Prefix.MSG_TYPE: Prefix,
+    Call.MSG_TYPE: Call,
+    CallResult.MSG_TYPE: CallResult,
+    CallError.MSG_TYPE: CallError,
+    Subscribe.MSG_TYPE: Subscribe,
+    Event.MSG_TYPE: Event,
+}
+
+
+class WampError(RuntimeError):
+    pass
+
+
+class WampClosedError(WampError):
+    pass
+
+
+class WampRpcTimeoutError(WampError):
+    pass
+
+
+class WampRpcRemoteError(WampError):
+    pass
+
+
+@dataclass
+class PendingRpc:
+    gate: asyncio.Event
+    result: Any = None
+    error: BaseException | None = None
+
+
+def _decode_message(data: Any) -> WampMessage:
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"Invalid WAMP payload: {data!r}")
+    try:
+        msg_type = WampMsgType(data[0])
+    except ValueError as exc:
+        raise ValueError(f"Unknown WAMP message type: {data[0]!r}") from exc
+
+    cls = MESSAGE_TYPES_BY_ID.get(msg_type)
+    if cls is None:
+        raise ValueError(f"Unsupported WAMP message type: {msg_type!r}")
+    return cls(*data[1:])
 
 
 class WampProtocol:
-    """
-    https://wamp-proto.org/wamp_bp_latest_ietf.html#name-session-establishment Offcourse nothing is compliant and the Onshape client doesn't even send a HELLO lol.
-    """
-
     def __init__(self, websocket: WebSocket):
         self._socket = websocket
         self._server_id = "snbridge v0.0.1"
-        self._session_id = _rand_id(16)
-
-        self.prefixes = {}
-        self.call_handlers: dict[str, Callable[..., CoroutineType[Any, Any, None]]] = {}
-        self.subscribe_handlers: dict[str, Callable[[Subscribe], CoroutineType[Any, Any, None]]] = {}
+        self._session_id = _generate_id(16)
+        self._send_lock = asyncio.Lock()
+        self.prefixes: dict[str, str] = {}
+        self.call_handlers: dict[str, Any] = {}
+        self.subscribe_handlers: dict[str, Any] = {}
 
     async def begin(self):
         await self._socket.accept(subprotocol="wamp")
         await self.send_message(Welcome(self._session_id, 1, self._server_id))
 
     async def send_message(self, msg: WampMessage):
-        logging.debug(f"sending WAMP message: {msg=}")
-        await self._socket.send_json(msg.serialize_with_msg_id())
+        payload = msg.serialize_with_msg_id()
+        if WIRE_LOG_WAMP:
+            logging.debug("sending WAMP message: %s", payload)
+        async with self._send_lock:
+            await self._socket.send_json(payload)
 
     async def next_message(self) -> WampMessage:
-        data = await self._socket.receive_json()
-        msg_type = WAMP_MSG_TYPE(data[0])
-        msg = WampMessage.REGISTRY[msg_type](*data[1:])
-        logging.debug(f"received WAMP message: {msg=}")
-        return msg
+        payload = await self._socket.receive_json()
+        if WIRE_LOG_WAMP:
+            logging.debug("received WAMP payload: %s", payload)
+        return _decode_message(payload)
+
+    def resolve(self, uri: str) -> str:
+        if ":" not in uri:
+            return uri
+        prefix, suffix = uri.split(":", 1)
+        base = self.prefixes.get(prefix)
+        return f"{base}{suffix}" if base is not None else uri
 
     async def run_message_handler(self, msg: WampMessage):
-        # Introspect WampSession class for handlers called handle_{msg_type}
-        handler = getattr(self, f"handle_{msg.MSG_TYPE.name.lower()}", self._handle_unimplemented_msg)
-        return await handler(msg)
-
-    async def _handle_unimplemented_msg(self, msg: WampMessage):
-        logging.warning("Unhandled WAMP message type: %s", msg.MSG_TYPE)
+        handler = {
+            Prefix.MSG_TYPE: self.handle_prefix,
+            Call.MSG_TYPE: self.handle_call,
+            Subscribe.MSG_TYPE: self.handle_subscribe,
+            CallResult.MSG_TYPE: self.handle_callresult,
+            CallError.MSG_TYPE: self.handle_callerror,
+        }.get(msg.MSG_TYPE)
+        if handler is None:
+            logging.warning("Ignoring WAMP message type %s", msg.MSG_TYPE.name)
+            return
+        await handler(msg)
 
     async def handle_prefix(self, msg: Prefix):
         self.prefixes[msg.prefix] = msg.uri
 
     async def handle_call(self, msg: Call):
-        rpc_name = self.resolve(msg.proc_uri)
-        rpc = self.call_handlers.get(rpc_name)
-
+        rpc = self.call_handlers.get(self.resolve(msg.proc_uri))
         if rpc is None:
-            logging.warning("Unhandled WAMP RPC: %s", msg.proc_uri)
-            await self.send_message(CallError(msg.call_id, "wamp.error.not_found", f"RPC {msg.proc_uri!r} not registered", details=None))
-        else:
-            await self.send_message(CallResult(msg.call_id, await rpc(*msg.args)))
+            await self.send_message(CallError(msg.call_id, "wamp.error.not_found", f"RPC {msg.proc_uri!r} not registered"))
+            return
+        result = await rpc(*msg.args)
+        await self.send_message(CallResult(msg.call_id, result))
 
     async def handle_subscribe(self, msg: Subscribe):
-        topic = self.resolve(msg.topic)
-        handler = self.subscribe_handlers.get(topic)
+        handler = self.subscribe_handlers.get(self.resolve(msg.topic))
         if handler is None:
-            logging.warning("Unknown subscribable: %s", topic)
-        else:
-            logging.debug(f"handle subscribe to '{topic}' by calling: {handler}")
-            await handler(msg)
+            logging.warning("Ignoring unknown subscription topic %s", msg.topic)
+            return
+        await handler(msg)
 
     async def handle_callresult(self, msg: CallResult):
-        logging.warning("No callresult handler for msg: %s", msg)
+        logging.warning("Ignoring unsolicited callresult for %s", msg.call_id)
 
     async def handle_callerror(self, msg: CallError):
-        logging.warning("No callerror handler for msg: %s", msg)
-
-    def resolve(self, uri: str) -> str:
-        """Resolve any registered prefixes in the uri"""
-        prefix, res = uri.split(":", 1)
-        return self.prefixes.get(prefix, "") + res
+        logging.warning("Ignoring unsolicited callerror for %s", msg.call_id)
 
 
 class WampSession:
-    """I'm honestly not even sure I should be keeping track of those rpcs? Maybe this whole stateHandler on top the WampProtocol is useless?"""
-
-    def __init__(self, websocket: WebSocket):
+    def __init__(self, websocket: WebSocket, rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S):
         self.wamp = WampProtocol(websocket)
-
-        self.in_flight_rpcs: dict[str, dict] = {}
-
+        self.rpc_timeout_s = rpc_timeout_s
+        self.pending_rpcs: dict[str, PendingRpc] = {}
+        self.closed = False
+        self.close_error: BaseException | None = None
         self.wamp.handle_callresult = self.handle_callresult
         self.wamp.handle_callerror = self.handle_callerror
 
+    async def close(self, exc: BaseException | None = None):
+        if self.closed:
+            return
+        self.closed = True
+        self.close_error = exc
+        error = exc or WampClosedError("WAMP session closed")
+        for rpc in self.pending_rpcs.values():
+            rpc.error = error
+            rpc.gate.set()
+
     async def start_wamp_message_stream(self):
-        while True:
-            msg = await self.wamp.next_message()
-            # They're all like.. interleaved.. have to create one task per message with the current approach.. Not very nice because it means errors don't bubble up
-            asyncio.create_task(self.wamp.run_message_handler(msg))
+        try:
+            while True:
+                await self.wamp.run_message_handler(await self.wamp.next_message())
+        except BaseException as exc:
+            await self.close(exc)
+            raise
 
-    async def client_rpc(self, controller_uri: str, method: str, *args):
-        """This function lives for the duration of the rpc. It registers the inflight request and waits for either handle_callresult or handle_callerror to finalize the rpc.."""
+    async def client_rpc(self, controller_uri: str, method: str, *args: Any):
+        if self.closed:
+            raise WampClosedError("WAMP session closed") from self.close_error
+
         call = Call.create(method, "", *args)
-        # Launch RPC in background as task. I guess? This is pretty unclear to me? Why are the calls wrapped in Events? Because of the Subscription?
-        await self.wamp.send_message(Event(controller_uri, call.serialize_with_msg_id()))
+        rpc = PendingRpc(gate=asyncio.Event())
+        self.pending_rpcs[call.call_id] = rpc
+        try:
+            await self.wamp.send_message(Event(controller_uri, call.serialize_with_msg_id()))
+            try:
+                await asyncio.wait_for(rpc.gate.wait(), timeout=self.rpc_timeout_s)
+            except TimeoutError as exc:
+                raise WampRpcTimeoutError(f"WAMP RPC timed out after {self.rpc_timeout_s}s: {call.proc_uri}") from exc
 
-        rpc = {"gate": asyncio.Event(), "result": None, "error": None}
-
-        self.in_flight_rpcs[call.call_id] = rpc
-        await rpc["gate"].wait()
-        del self.in_flight_rpcs[call.call_id]
-
-        if rpc["error"] is not None:
-            logging.error('Encountered error "%s" during %s', rpc["error"], call)
-            raise ValueError(rpc["error"])
-        return rpc["result"]
+            if rpc.error is not None:
+                raise rpc.error
+            return rpc.result
+        except BaseException as exc:
+            if not isinstance(exc, (WampRpcRemoteError, WampRpcTimeoutError, WampClosedError)) and not self.closed:
+                await self.close(exc)
+            raise
+        finally:
+            self.pending_rpcs.pop(call.call_id, None)
 
     async def handle_callresult(self, msg: CallResult):
-        rpc = self.in_flight_rpcs[msg.call_id]
-        rpc["result"] = msg.result
-        rpc["gate"].set()
+        rpc = self.pending_rpcs.get(msg.call_id)
+        if rpc is None:
+            logging.warning("Ignoring unexpected WAMP callresult for %s", msg.call_id)
+            return
+        rpc.result = msg.result
+        rpc.gate.set()
 
     async def handle_callerror(self, msg: CallError):
-        rpc = self.in_flight_rpcs[msg.call_id]
-        rpc["error"] = (msg.error_uri, msg.desc)
-        rpc["gate"].set()
+        rpc = self.pending_rpcs.get(msg.call_id)
+        if rpc is None:
+            logging.warning("Ignoring unexpected WAMP callerror for %s", msg.call_id)
+            return
+        rpc.error = WampRpcRemoteError(f"{msg.error_uri}: {msg.desc}")
+        rpc.gate.set()

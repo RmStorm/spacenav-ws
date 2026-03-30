@@ -1,20 +1,43 @@
 [project]
 name = "spacenav-ws"
 version = "0.1.5"
-description = "SpaceNav WebSocket Bridge for using a 3dConnexion spacemouse with onshape"
+description = "Expose a local SpaceMouse to browser CAD clients over TLS WebSocket"
 readme = "README.md"
-authors = [{ name = "RmStorm", email = "roaldstorm@gmail.com" }]
+license = "GPL-3.0-only"
+authors = [
+    { name = "RmStorm", email = "roaldstorm@gmail.com" },
+    { name = "Robert Jördens", email = "rj@quartiq.de" },
+]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.12",
     "numpy>=2.2.5",
-    "scipy>=1.15.2",
+    "rich>=13.9.4",
     "typer>=0.15.2",
     "uvicorn[standard]>=0.34.2",
 ]
+keywords = ["3dconnexion", "cad", "onshape", "spacemouse", "spacenav", "websocket"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+]
 
 [dependency-groups]
-dev = ["pytest>=8.3.5"]
+dev = ["pytest>=8.3.5", "ruff>=0.11.13"]
+
+[project.urls]
+Homepage = "https://github.com/RmStorm/spacenav-ws"
+Repository = "https://github.com/RmStorm/spacenav-ws"
+Issues = "https://github.com/RmStorm/spacenav-ws/issues"
 
 [project.scripts]
 spacenav-ws = "spacenav_ws.main:cli"
@@ -22,6 +45,9 @@ spacenav-ws = "spacenav_ws.main:cli"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spacenav_ws"]
 
 [tool.ruff]
 line-length = 150

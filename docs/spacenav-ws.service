@@ -1,0 +1,17 @@
+# Copy this file to ~/.config/systemd/user/spacenav-ws.service
+# Replace /path/to/repo with the absolute path to your checkout.
+
+[Unit]
+Description=Expose a local SpaceMouse to browser CAD clients
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/repo
+Environment=SPACENAV_WS_LOG_LEVEL=INFO
+ExecStart=/path/to/repo/.venv/bin/spacenav-ws serve --host 127.51.68.120 --port 8181
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

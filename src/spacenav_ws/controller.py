@@ -1,192 +1,205 @@
+from __future__ import annotations
+
 import asyncio
 import logging
-import struct
+from dataclasses import astuple, dataclass, field, replace
+from time import monotonic
 from typing import Any
 
-import numpy as np
-from scipy.spatial import transform
+from spacenav_ws.navigation import NavigationConfig, apply_motion_with_mode, motion_activity
+from spacenav_ws.onshape_bridge import OnshapeBridge, PivotUnavailableError
+from spacenav_ws.raw_input import PACKET_SIZE, decode_packet
+from spacenav_ws.types import ButtonSample, MotionSample, MotionAxesMode, NavigationMode
+from spacenav_ws.wamp import Call, CallResult, Prefix, Subscribe, WampSession
 
-from spacenav_ws.spacenav import MotionEvent, ButtonEvent, from_message
-from spacenav_ws.wamp import WampSession, Prefix, Call, Subscribe, CallResult
-
-
-class Mouse3d:
-    """This bad boy doesn't do a damn thing right now!"""
-
-    def __init__(self):
-        self.id = "mouse0"
+SUPPORTED_CLIENT_NAMES = {"Onshape", "WebThreeJS Sample", "web_threejs.html"}
+NAVIGATION_MODE_TOGGLE_BUTTON = 0
+MOTION_AXES_CYCLE_BUTTON = 1
 
 
+def motion_log_fields(sample: MotionSample) -> tuple[int, int, int, int, int, int, int]:
+    return astuple(sample)[:-1]
+
+
+def filter_motion_sample(sample: MotionSample, axes_mode: MotionAxesMode) -> MotionSample:
+    if axes_mode is MotionAxesMode.ALL:
+        return sample
+    if axes_mode is MotionAxesMode.ROTATION_ONLY:
+        return replace(sample, tx=0, ty=0, tz=0)
+    return replace(sample, rx=0, ry=0, rz=0)
+
+
+@dataclass
 class Controller:
-    """Manage shared state and event streaming between a local 3D mouse and a remote client.
+    reader: asyncio.StreamReader
+    session: WampSession
+    client_metadata: dict[str, Any]
+    nav_config: NavigationConfig = field(default_factory=NavigationConfig)
+    stop_idle_timeout_s: float = 0.2
 
-    This class subscribes clients over WAMP, tracks focus/subscription state,
-    reads raw 3D mouse data from an asyncio.StreamReader, and forwards
-    MotionEvent/ButtonEvent updates back to the client via RPC. It also
-    provides utility methods for affine‐pivot calculations and generic
-    remote_read/write operations.
-
-    Args:
-        reader (asyncio.StreamReader):
-            Asynchronous stream reader for receiving raw 3D mouse packets.
-        _ (Mouse3d):
-            Doesn't do anything.. things should be restructured so that it does probably.
-        wamp_state_handler (WampSession):
-            WAMP session handler that manages subscriptions and RPC calls.
-        client_metadata (dict):
-            Metadata about the connected client (e.g. its name and capabilities).
-
-    Attributes:
-        id (str):
-            Unique identifier for this controller instance (defaults to "controller0").
-        client_metadata (dict):
-            Same as the constructor arg: information about the client.
-        reader (asyncio.StreamReader):
-            Stream reader for incoming mouse event bytes.
-        wamp_state_handler (WampSession):
-            WAMP session object for subscribing and remote RPC.
-        subscribed (bool):
-            True once the client has subscribed to this controller’s URI.
-        focus (bool):
-            True when this controller is in focus and should send events.
-    """
-
-    def __init__(self, reader: asyncio.StreamReader, _: Mouse3d, wamp_state_handler: WampSession, client_metadata: dict):
+    def __post_init__(self):
         self.id = "controller0"
-        self.client_metadata = client_metadata
-        self.reader = reader
-        self.wamp_state_handler = wamp_state_handler
-
-        self.wamp_state_handler.wamp.subscribe_handlers[self.controller_uri] = self.subscribe
-        self.wamp_state_handler.wamp.call_handlers["wss://127.51.68.120/3dconnexion#update"] = self.client_update
-
         self.subscribed = False
         self.focus = False
+        self.bridge = OnshapeBridge(self.session, self.controller_uri)
+        self.motion_active = False
+        self.last_motion_at = 0.0
+        self.latest_motion: MotionSample | None = None
+        self.motion_ready = asyncio.Event()
+        self.mode = NavigationMode.OBJECT
+        self.axes_mode = MotionAxesMode.ALL
+        self.session.wamp.subscribe_handlers[self.controller_uri] = self.subscribe
+        self.session.wamp.call_handlers[self.session.wamp.resolve("3dx_rpc:update")] = self.client_update
+
+    @property
+    def controller_uri(self) -> str:
+        return self.session.wamp.resolve(f"3dconnexion:3dcontroller/{self.id}")
+
+    def is_supported_client(self) -> bool:
+        return self.client_metadata.get("name") in SUPPORTED_CLIENT_NAMES
 
     async def subscribe(self, msg: Subscribe):
-        """When a subscription request for self.controller_uri comes in we start broadcasting!"""
         logging.info("handling subscribe %s", msg)
         self.subscribed = True
         self.focus = True
 
     async def client_update(self, controller_id: str, args: dict[str, Any]):
-        # TODO Maybe use some more of this data that the client sends our way?
-        logging.debug("Got update for '%s': %s, THESE ARE DROPPED FOR NOW!", controller_id, args)
+        logging.debug("Got update for '%s': %s", controller_id, args)
         if (focus := args.get("focus")) is not None:
-            self.focus = focus
-
-    @property
-    def controller_uri(self) -> str:
-        return f"wss://127.51.68.120/3dconnexion3dcontroller/{self.id}"
-
-    async def remote_write(self, *args):
-        return await self.wamp_state_handler.client_rpc(self.controller_uri, "self:update", *args)
-
-    async def remote_read(self, *args):
-        return await self.wamp_state_handler.client_rpc(self.controller_uri, "self:read", *args)
+            self.focus = bool(focus)
+            if not self.focus:
+                await self._stop_motion()
 
     async def start_mouse_event_stream(self):
-        """Right now we try to send every event to the client.. we should possibly maybe debounce?"""
         logging.info("Starting the mouse stream")
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self._poll_input_loop(), name="input")
+            tg.create_task(self._motion_loop(), name="motion")
+            tg.create_task(self._stop_idle_loop(), name="stop-idle")
+
+    async def _poll_input_loop(self):
         while True:
-            mouse_event = await self.reader.read(32)
-            if self.focus and self.subscribed:
-                nums = struct.unpack("iiiiiiii", mouse_event)
-                event = from_message(list(nums))
-                if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
-                    await self.update_client(event)
-                else:
-                    logging.warning("Unknown client! Cannot send mouse events, client_metadata:%s", self.client_metadata)
+            packet = await self.reader.readexactly(PACKET_SIZE)
+            event = decode_packet(packet)
+            if isinstance(event, MotionSample):
+                self.last_motion_at = monotonic()
+                self.latest_motion = event
+                self.motion_ready.set()
+            elif isinstance(event, ButtonSample) and event.pressed:
+                await self._handle_button(event.button_id)
 
-    @staticmethod
-    def get_affine_pivot_matrices(model_extents):
-        min_pt = np.array(model_extents[0:3], dtype=np.float32)
-        max_pt = np.array(model_extents[3:6], dtype=np.float32)
-        pivot = (min_pt + max_pt) * 0.5
+    async def _motion_loop(self):
+        while True:
+            await self.motion_ready.wait()
+            self.motion_ready.clear()
+            event = self.latest_motion
+            self.latest_motion = None
+            if event is None:
+                continue
+            await self._handle_motion(event)
 
-        pivot_pos = np.eye(4, dtype=np.float32)
-        pivot_pos[3, :3] = pivot
-        pivot_neg = np.eye(4, dtype=np.float32)
-        pivot_neg[3, :3] = -pivot
-        return pivot_pos, pivot_neg
+    async def _handle_button(self, button_id: int):
+        if not self.is_supported_client():
+            return
+        if button_id == NAVIGATION_MODE_TOGGLE_BUTTON:
+            self.mode = NavigationMode.TARGET_CAMERA if self.mode is NavigationMode.OBJECT else NavigationMode.OBJECT
+            logging.info("Switched navigation mode to %s", self.mode.value)
+            await self._stop_motion()
+            return
+        if button_id == MOTION_AXES_CYCLE_BUTTON:
+            self.axes_mode = {
+                MotionAxesMode.ALL: MotionAxesMode.ROTATION_ONLY,
+                MotionAxesMode.ROTATION_ONLY: MotionAxesMode.TRANSLATION_ONLY,
+                MotionAxesMode.TRANSLATION_ONLY: MotionAxesMode.ALL,
+            }[self.axes_mode]
+            logging.info("Switched motion axes mode to %s", self.axes_mode.value)
+            await self._stop_motion()
 
-    async def update_client(self, event: MotionEvent | ButtonEvent):
-        """
-        This send mouse events over to the client. Currently just a few properties are used but more are avaialable:
-        view.target, view.constructionPlane, view.extents, view.affine, view.perspective, model.extents, selection.empty, selection.extents, hit.lookat, views.front
-
-        """
-        model_extents = await self.remote_read("model.extents")
-
-        if isinstance(event, ButtonEvent):
-            await self.remote_write("view.affine", await self.remote_read("views.front"))
-            await self.remote_write("view.extents", [c * 1.2 for c in model_extents])
+    async def _handle_motion(self, event: MotionSample):
+        if not (self.focus and self.subscribed and self.is_supported_client()):
             return
 
-        # 1) pull down the current extents and model matrix
-        perspective = await self.remote_read("view.perspective")
-        curr_affine = np.asarray(await self.remote_read("view.affine"), dtype=np.float32).reshape(4, 4)
+        sample = replace(event, period_ms=max(0, event.period_ms))
+        sample = filter_motion_sample(sample, self.axes_mode)
+        if motion_activity(sample, self.nav_config) <= 0.0:
+            await self._stop_motion()
+            return
 
-        # This (transpose of top left quadrant) is the correct way to get the rotation matrix of the camera but it is unstable.. Either of the below methods works fine though.
-        R_cam = curr_affine[:3, :3].T
-        # cam2world = np.linalg.inv(curr_affine)
-        # R_cam = cam2world[:3, :3]
-        U, _, Vt = np.linalg.svd(R_cam)
-        R_cam = U @ Vt
+        gesture_start = not self.motion_active
+        if gesture_start:
+            logging.debug("Starting motion gesture")
+            await self.bridge.set_motion(True)
+            self.motion_active = True
 
-        # 2) Seperately calculate rotation and translation matrices
-        angles = np.array([event.pitch, event.yaw, -event.roll]) * 0.02
-        R_delta_cam = transform.Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
-        R_world = R_cam @ R_delta_cam @ R_cam.T
+        logging.debug("Reading current navigation state")
+        try:
+            current_state = await self.bridge.read_navigation_state()
+        except PivotUnavailableError as exc:
+            logging.warning(str(exc))
+            await self._stop_motion()
+            return
+        # spacenavd's motion.period is time since the previous emitted motion event.
+        # After idle silence, the first non-zero sample can carry a large period that
+        # should not be integrated as active motion. Bootstrap the gesture with dt=0.
+        if gesture_start:
+            sample = replace(sample, period_ms=0)
 
-        rot_delta = np.eye(4, dtype=np.float32)
-        rot_delta[:3, :3] = R_world
-        trans_delta = np.eye(4, dtype=np.float32)
-        trans_delta[3, :3] = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.0005
+        next_state = apply_motion_with_mode(current_state, sample, self.nav_config, self.mode)
+        logging.debug(
+            "Writing navigation update tx=%s ty=%s tz=%s rx=%s ry=%s rz=%s dt_ms=%s",
+            *motion_log_fields(sample),
+        )
+        await self.bridge.write_navigation_state(next_state, previous_state=current_state)
 
-        # 3) Apply changes to the ModelViewProjection matrix
-        pivot_pos, pivot_neg = self.get_affine_pivot_matrices(model_extents)
-        new_affine = trans_delta @ curr_affine @ (pivot_neg @ rot_delta @ pivot_pos)
+    async def _stop_idle_loop(self):
+        while True:
+            await asyncio.sleep(self.stop_idle_timeout_s / 4.0)
+            if not self.motion_active:
+                continue
+            if monotonic() - self.last_motion_at > self.stop_idle_timeout_s:
+                await self._stop_motion()
 
-        # Write back changes and optionally update extents if the projection is orthographic!
-        if not perspective:
-            extents = await self.remote_read("view.extents")
-            zoom_delta = event.y * 0.0002
-            scale = 1.0 + zoom_delta
-            new_extents = [c * scale for c in extents]
-            await self.remote_write("motion", True)
-            await self.remote_write("view.extents", new_extents)
-        else:
-            await self.remote_write("motion", True)
-        await self.remote_write("view.affine", new_affine.reshape(-1).tolist())
+    async def _stop_motion(self):
+        if self.motion_active:
+            logging.debug("Stopping motion gesture")
+            await self.bridge.set_motion(False)
+        self.motion_active = False
 
 
-async def create_mouse_controller(wamp_state_handler: WampSession, spacenav_reader: asyncio.StreamReader) -> Controller:
-    """
-    This takes in an active websocket wrapped in a wampsession, it consumes the first couple of messages that form a sort of pseudo handshake..
-    When all is said is done it returns an active controller!
-    """
-    await wamp_state_handler.wamp.begin()
-    # The first three messages are typically prefix setters!
-    msg = await wamp_state_handler.wamp.next_message()
+async def create_mouse_controller(
+    session: WampSession,
+    spacenav_reader: asyncio.StreamReader,
+    nav_config: NavigationConfig | None = None,
+) -> Controller:
+    async def expect_create(*prefix_args: Any) -> Call:
+        msg = await session.wamp.next_message()
+        assert isinstance(msg, Call)
+        assert msg.proc_uri == "3dx_rpc:create"
+        assert tuple(msg.args[: len(prefix_args)]) == prefix_args
+        return msg
+
+    await session.wamp.begin()
+    msg = await session.wamp.next_message()
     while isinstance(msg, Prefix):
-        await wamp_state_handler.wamp.run_message_handler(msg)
-        msg = await wamp_state_handler.wamp.next_message()
+        await session.wamp.run_message_handler(msg)
+        msg = await session.wamp.next_message()
 
-    # The first call after the prefixes must be 'create mouse'
     assert isinstance(msg, Call)
-    assert msg.proc_uri == "3dx_rpc:create" and msg.args[0] == "3dconnexion:3dmouse"
-    mouse = Mouse3d()  # There is really no point to this lol
-    logging.info(f'Created 3d mouse "{mouse.id}" for version {msg.args[1]}')
-    await wamp_state_handler.wamp.send_message(CallResult(msg.call_id, {"connexion": mouse.id}))
+    assert msg.proc_uri == "3dx_rpc:create"
+    assert tuple(msg.args[:1]) == ("3dconnexion:3dmouse",)
+    mouse_id = "mouse0"
+    logging.info('Created 3d mouse "%s" for version %s', mouse_id, msg.args[1])
+    await session.wamp.send_message(CallResult(msg.call_id, {"connexion": mouse_id}))
 
-    # And the second call after the prefixes must be 'create controller'
-    msg = await wamp_state_handler.wamp.next_message()
-    assert isinstance(msg, Call)
-    assert msg.proc_uri == "3dx_rpc:create" and msg.args[0] == "3dconnexion:3dcontroller" and msg.args[1] == mouse.id
+    msg = await expect_create("3dconnexion:3dcontroller", mouse_id)
     metadata = msg.args[2]
-    controller = Controller(spacenav_reader, mouse, wamp_state_handler, metadata)
-    logging.info(f'Created controller "{controller.id}" for mouse "{mouse.id}", for client "{metadata["name"]}", version "{metadata["version"]}"')
-
-    await wamp_state_handler.wamp.send_message(CallResult(msg.call_id, {"instance": controller.id}))
+    controller = Controller(spacenav_reader, session, metadata, nav_config=nav_config or NavigationConfig())
+    logging.info(
+        'Created controller "%s" for mouse "%s", for client "%s", version "%s"',
+        controller.id,
+        mouse_id,
+        metadata["name"],
+        metadata["version"],
+    )
+    await session.wamp.send_message(CallResult(msg.call_id, {"instance": controller.id}))
     return controller
