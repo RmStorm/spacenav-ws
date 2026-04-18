@@ -9,6 +9,7 @@
 - [About](#about)  
 - [Prerequisites](#prerequisites)  
 - [Usage](#usage)  
+- [Sensitivity](#change-camera-sensitivity)  
 - [Development](#development)  
 
 ## About
@@ -42,6 +43,17 @@ Now open: [https://127.51.68.120:8181](https://127.51.68.120:8181). When prompte
 Install [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/?utm_source=addons.mozilla.org&utm_medium=referral&utm_content=search). After installing, click this [link](https://greasyfork.org/en/scripts/533516-onshape-3d-mouse-on-linux-in-page-patch) for one‑click install of the script.
 
 4. **Open an Onshape document and test your mouse!**
+
+## Change camera sensitivity
+
+To change the sensitivity of the camera, you can edit the values in the `controller.py` file.
+
+| Variable                               | Description                     | Default |
+| -------------------------------------- | ------------------------------- | ------- |
+| CAMERA_ANGLE_SENSITIVITY               | Rotation: Pitch, yaw and roll   | 0.02    |
+| CAMERA_TRANSLATION_SENSITIVITY         | Movement: X, Z and Y            | 0.0005  |
+| CAMERA_ZOOM_SENSITIVITIY_ORTHOGRAPHIC  | Zoom for orthographic view mode | 0.0002  |
+
 
 ## Developing
 

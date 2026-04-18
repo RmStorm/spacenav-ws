@@ -10,6 +10,11 @@ from spacenav_ws.spacenav import MotionEvent, ButtonEvent, from_message
 from spacenav_ws.wamp import WampSession, Prefix, Call, Subscribe, CallResult
 
 
+CAMERA_ANGLE_SENSITIVITY = 0.02                  # Sensitivity value for the camera rotation aka angle
+CAMERA_TRANSLATION_SENSITIVITY = 0.0005          # Sensitivity value for the camera movement aka translation
+CAMERA_ZOOM_SENSITIVITIY_ORTHOGRAPHIC = 0.0002   # Sensitivity value for the camera zoom in orthographic view mode
+
+
 class Mouse3d:
     """This bad boy doesn't do a damn thing right now!"""
 
@@ -135,14 +140,14 @@ class Controller:
         R_cam = U @ Vt
 
         # 2) Seperately calculate rotation and translation matrices
-        angles = np.array([event.pitch, event.yaw, -event.roll]) * 0.02
+        angles = np.array([event.pitch, event.yaw, -event.roll]) * CAMERA_ANGLE_SENSITIVITY
         R_delta_cam = transform.Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
         R_world = R_cam @ R_delta_cam @ R_cam.T
 
         rot_delta = np.eye(4, dtype=np.float32)
         rot_delta[:3, :3] = R_world
         trans_delta = np.eye(4, dtype=np.float32)
-        trans_delta[3, :3] = np.array([-event.x, -event.z, event.y], dtype=np.float32) * 0.0005
+        trans_delta[3, :3] = np.array([-event.x, -event.z, event.y], dtype=np.float32) * CAMERA_TRANSLATION_SENSITIVITY
 
         # 3) Apply changes to the ModelViewProjection matrix
         pivot_pos, pivot_neg = self.get_affine_pivot_matrices(model_extents)
@@ -151,7 +156,7 @@ class Controller:
         # Write back changes and optionally update extents if the projection is orthographic!
         if not perspective:
             extents = await self.remote_read("view.extents")
-            zoom_delta = event.y * 0.0002
+            zoom_delta = event.y * CAMERA_ZOOM_SENSITIVITIY_ORTHOGRAPHIC
             scale = 1.0 + zoom_delta
             new_extents = [c * scale for c in extents]
             await self.remote_write("motion", True)
