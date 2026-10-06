@@ -23,13 +23,16 @@ ORIGINS = [
     "https://3dconnexion.com",
     "https://cad.onshape.com",
 ]
+ORIGIN_REGEX = r"https://.*\.3dexperience\.3ds\.com"
 
 CERT_FILE = Path(__file__).parent / "certs" / "ip.crt"
 KEY_FILE = Path(__file__).parent / "certs" / "ip.key"
 
 cli = typer.Typer()
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["GET", "OPTIONS"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware, allow_origins=ORIGINS, allow_origin_regex=ORIGIN_REGEX, allow_methods=["GET", "OPTIONS"], allow_headers=["*"]
+)
 
 
 @app.get("/3dconnexion/nlproxy")

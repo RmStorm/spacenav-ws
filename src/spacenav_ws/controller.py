@@ -93,7 +93,7 @@ class Controller:
             if self.focus and self.subscribed:
                 nums = struct.unpack("iiiiiiii", mouse_event)
                 event = from_message(list(nums))
-                if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample"]:
+                if self.client_metadata["name"] in ["Onshape", "WebThreeJS Sample", "SOLIDWORKS xDesign"]:
                     await self.update_client(event)
                 else:
                     logging.warning("Unknown client! Cannot send mouse events, client_metadata:%s", self.client_metadata)
